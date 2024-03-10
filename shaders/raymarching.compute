@@ -1,0 +1,294 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#pragma target 5.0
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result; 
+
+int _xResolution = 512;
+int _yResolution = 512;
+
+bool _debugShowNormals = false;
+
+float _epsilon = 0.0001;
+float _maxDistance = 100.0;
+float _maxSteps = 100;
+
+float3 _cameraPosition = float3(1, 1, 0);
+float3 _cameraForward = float3(0, 0, 1);
+float3 _cameraUp = float3(0, 1, 0);
+float3 _cameraRight = float3(1, 0, 0);
+float _cameraFov = 1.0;
+float _cameraAspect = 1.0;
+float _time = 0.0;
+
+float _roughness = 1;
+float _specular = 0.5;
+float3 diffuse = float3(0.9, 0.4, 0.5);
+
+// Subsurf settings:
+float _subsurfScale = 0.1; // Distance per step
+float _subsurfStrength = 0.5; // Strength of the effect
+float _subsurfIterations = 3; // Number of iterations
+
+RWStructuredBuffer<float3> _accumBuffer;
+float _frame = 0;
+
+float random(float p){
+    float seed = sin(_time) * 1000;
+    seed += sin(_frame * 3) * 1000;
+    return frac(sin(p * 12.9898 + 78.233) * 43758.5453);
+}
+
+float random(float3 p){
+    float seed = sin(_time) * 1000;
+    seed += sin(_frame * 3) * 1000;
+    return frac(sin(dot(p, float3(12.9898, 78.233, 151.7182)) + seed) * 43758.5453);
+}
+
+float3 roughness(float3 ref, float3 normal){
+    float3 u = normalize(cross(ref, normal));
+    float3 v = normalize(cross(ref, u));
+    float r1 = 2 * 3.14159265359 * random(ref);
+    float r2 = random(ref);
+    float r2s = sqrt(r2);
+    float3 result = normalize(u * cos(r1) * r2s + v * sin(r1) * r2s + ref * sqrt(1 - r2));
+    return result;
+}
+
+/*
+float de(float3 p){
+    float scale = 1.0;
+    float orb = 10000.0;
+    for (int i = 0; i < 6; i++){
+        p = -1.0 + 2.0*frac(0.5*p+0.5);
+        p -= sign(p)*0.04; // trick
+        float r2 = dot(p,p);
+        float k = 0.95/r2;
+        p *= k;
+        scale *= k;
+        orb = min(orb, r2);
+    }
+
+    float d1 = sqrt(min(min(dot(p.xy, p.xy), dot(p.yz, p.yz)), dot(p.zx, p.zx))) - 0.02;
+
+    float d2 = abs(p.y);
+    float dmi = d2;
+    if (d1 < d2) {
+        dmi = d1;
+    }
+
+    return 0.5 * dmi / scale;
+}
+*/
+
+float PI = 3.14159265359;
+
+
+
+float de(float3 p) {
+    p = p.xzy;
+    float3 cSize = float3(1, 1, 1.3);
+    float scale = 1.0;
+
+    for (int i = 0; i < 12; i++) {
+        p = 2.0 * clamp(p, -cSize, cSize) - p;
+        float r2 = dot(p, p);
+        float k = max((2.0)/(r2), 0.027);
+        p *= k;
+        scale *= k;
+    }
+
+    float l = length(p.xy);
+    float rxy = l - 4.0;
+    float n = l * p.z;
+
+    rxy = max(rxy, -(n) / 4.0);
+    return (rxy) / abs(scale);
+}
+
+float light_de(float3 p){
+    float radius = 0.5;
+    p -= float3(0,-1.25,1);
+    return length(p.yz) - radius;
+}
+
+float raymarch(float3 ro, float3 rd, out bool hitLight){
+    float dO = 0.0;
+    float dS = 0.0;
+
+    hitLight = false;
+
+    float3 p = ro;
+
+    for (int i = 0; i < _maxSteps; i++){
+        dS = de(p);
+        float dL = light_de(p);
+
+        dO += dS;
+        p += dS * rd;
+
+
+        if (dL < _epsilon){
+            hitLight = true;
+            break;
+        }
+
+        if (dS < _epsilon){
+            break;
+        }
+    
+    }
+
+    if (dO > _maxDistance){
+        dO = -1.0;
+    }
+
+    return dO;
+}
+
+float3 GetNormal(float3 p){
+    float3 e = float3(_epsilon, 0, 0);
+    return normalize(float3(
+        de(p + e.xyy) - de(p - e.xyy),
+        de(p + e.yxy) - de(p - e.yxy),
+        de(p + e.yyx) - de(p - e.yyx)
+    ));
+}
+
+float3 march(float3 ro, float3 rd, out bool hitLight, out float3 normal, out float3 impact){
+    float d = raymarch(ro, rd, hitLight);
+
+    impact = ro + d * rd;
+
+    if (d < 0.0){
+        return float3(0, 0, 0);
+    }
+
+    float3 p = ro + d * rd;
+    normal = GetNormal(p);
+
+    float3 result = float3(0,0,0);//normal * 0.5 + 0.5;
+
+    if (hitLight){
+        result = float3(1, 1, 1);
+    }
+
+    return result;
+}
+
+float3 ray_trace(float3 ro, float3 rd, float bounces){
+    float3 result = float3(0, 0, 0);
+    float3 normal = float3(0, 0, 0);
+    float3 impact = float3(0, 0, 0);
+    float transmittance = 1.0;
+    float3 attenuation = float3(1, 1, 1);
+
+    bool hitLight = false;
+    for (int i = 0; i < bounces; i++){
+        float3 outcol = march(ro, rd, hitLight, normal, impact);
+        if (hitLight){
+            result += transmittance * attenuation;
+            break;
+        }
+
+        result += transmittance * attenuation * outcol;
+
+        transmittance *= 0.8;
+        attenuation *= diffuse;
+
+        normal = GetNormal(impact);
+        float3 ref = reflect(rd, normal);
+        float3 rough = roughness(ref, normal);
+
+        // Specular.
+        {
+            bool HL = false;
+            float3 n = float3(0, 0, 0);
+            float3 i = float3(0, 0, 0);
+            float3 out_col = march(impact + normal * 0.01, ref, HL, n, i);
+            if (HL)
+            {
+                result += transmittance * attenuation * out_col * _specular;
+            }
+        }
+        
+        // Subsurface scattering.
+        {
+            float3 sub_result = float3(0, 0, 0);
+
+            if (_subsurfStrength != 0)
+            {
+                float3 n = normal;
+                float3 i = impact;
+                for (int j = 0; j < _subsurfIterations; j++){
+                    bool HL = false;
+                    float random_dir_x = random(i.x + _time * 1.23) - 0.5;
+                    float random_dir_y = random(i.y + _time * 2.34) - 0.5;
+                    float random_dir_z = random(i.z + _time * 3.45) - 0.5;
+                    float3 random_dir = normalize(float3(random_dir_x, random_dir_y, random_dir_z));
+                    float3 out_col = march(i - n * 0.02, random_dir, HL, n, i);
+                    if (HL){
+                        sub_result += out_col * attenuation;
+                    }
+                }
+                result += transmittance * attenuation * sub_result * _subsurfStrength;
+
+            }
+        }
+        
+        rd = normalize(lerp(ref, rough, _roughness));
+        ro = impact + normal * 0.01;
+
+        if (transmittance < 0.01){
+            break;
+        }
+    }
+
+    return result;
+}
+
+[numthreads(16,16,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    //float aspect = _yResolution / _xResolution;
+    float2 uv = id.xy / float2(_xResolution, _yResolution);
+    
+    float x = tan(_cameraFov * 0.5) * (2.0 * uv.x - 1.0);
+    float y = tan(_cameraFov * 0.5) * (1.0 - 2.0 * uv.y) * _cameraAspect;
+
+    float3 rd = normalize(_cameraForward - x * _cameraRight + y * _cameraUp);
+    float3 ro = _cameraPosition;
+
+    float3 fin_color =float3(0,0,0) ;//ray_trace(ro, rd, 8);
+    if (_debugShowNormals)
+    {
+        float3 normal = float3(0, 0, 0);
+        float3 impact = float3(0, 0, 0);
+        bool hitLight = false;
+        fin_color = GetNormal(ro + raymarch(ro, rd, hitLight) * rd) * 0.5 + 0.5;
+    }else
+    {
+        float3 rand_rd = rd;
+        rand_rd.x += random(frac(rd.x + _time * 1.23) - 0.5);
+        rand_rd.y += random(frac(rd.y + _time * 2.34) - 0.5);
+        rand_rd.z += random(frac(rd.z + _time * 3.45) - 0.5);
+
+        rd = normalize(rd + rand_rd * 0.001);
+        fin_color = ray_trace(ro, rd, 8);
+    }
+    float3 accum = _accumBuffer[id.x + id.y * _xResolution];
+
+    if (_frame == 0){
+        accum = fin_color;
+    } else {
+        accum = lerp(accum, fin_color, 1.0 / (_frame + 1));
+    }
+
+    _accumBuffer[id.x + id.y * _xResolution] = accum;
+
+    fin_color = accum;
+    
+    Result[id.xy] = float4(fin_color, 1.0);
+}
